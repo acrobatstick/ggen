@@ -96,7 +96,7 @@ func run(c *cli.Command) error {
 	var p string
 
 	p = c.StringArg("path")
-	p, err = resolvePath(p)
+	p, err = srcIntoAbs(p)
 	if err != nil {
 		return fmt.Errorf("error while resolving path: %v", err)
 	}
@@ -116,7 +116,7 @@ func run(c *cli.Command) error {
 	// spawn workers
 	for i := 0; i < procs; i++ {
 		wg.Add(1)
-		go worker(computes, results, &wg)
+		go worker(computes, results, p, &wg)
 	}
 
 	// send job to workers
@@ -144,13 +144,14 @@ func run(c *cli.Command) error {
 	}
 
 	base := path.Base(p)
-	if err := marshalPage(base, entries); err != nil {
+	absPath := fmt.Sprintf("%s/%s.html", p, base)
+	if err := marshalPage(absPath, entries); err != nil {
 		return fmt.Errorf("error while marshaling html page: %v", err)
 	}
 
 	open := c.Bool("open")
 	if open {
-		url := fmt.Sprintf("file://%s/%s.html", p, base)
+		url := fmt.Sprintf("file://%s", absPath)
 		return openURL(url)
 	}
 
@@ -201,9 +202,10 @@ func isWSL() bool {
 	return strings.Contains(strings.ToLower(string(releaseData)), "microsoft")
 }
 
-func resolvePath(target string) (string, error) {
-	p := target
-	if target == "." || target == "" {
+// turns every path into absolute path
+func srcIntoAbs(src string) (string, error) {
+	p := src
+	if src == "." || src == "" {
 		dir, err := os.Getwd()
 		if err != nil {
 			return "", err
@@ -274,15 +276,16 @@ func getMedia(src string) []Media {
 	}
 
 	// check for existing cache
-	htmlpagePath := fmt.Sprintf("%s.html", path.Base(src))
-	_, err = os.Stat(htmlpagePath)
+	base := path.Base(src)
+	absPath := fmt.Sprintf("%s/%s.html", src, base)
+	_, err = os.Stat(absPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return mediaEntries
 		}
 	}
 
-	page, err := os.Open(htmlpagePath)
+	page, err := os.Open(absPath)
 	if err != nil {
 		panic(fmt.Sprintf("error opening html page file: %v", err))
 	}
@@ -305,13 +308,13 @@ func getMedia(src string) []Media {
 	return mediaEntries
 }
 
-func worker(computes <-chan *Media, results chan<- result, wg *sync.WaitGroup) {
+func worker(computes <-chan *Media, results chan<- result, src string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for media := range computes {
-		resCode, err := computePreview(media)
+		resCode, err := computePreview(src, media)
 
 		if err != nil {
-			fmt.Printf("error generating preview image: %v", err)
+			fmt.Printf("error generating preview image: %v\n", err)
 			results <- result{path: media.Path, status: resCode}
 			continue
 		}
@@ -323,7 +326,7 @@ func worker(computes <-chan *Media, results chan<- result, wg *sync.WaitGroup) {
 // default height of the resized preview image is set to 150px
 const defaultPreviewHeight = 150
 
-func computePreview(media *Media) (resultStatus, error) {
+func computePreview(src string, media *Media) (resultStatus, error) {
 	// skip if cached already
 	// TODO: should not skip if height provided is different from the already generated page
 	if len(media.Src) != 0 {
@@ -332,7 +335,7 @@ func computePreview(media *Media) (resultStatus, error) {
 
 	switch media.format {
 	case jpgformat, pngformat:
-		img, err := imaging.Open(media.Path)
+		img, err := imaging.Open(path.Join(src, media.Path))
 		if err != nil {
 			return resultFailed, err
 		}
@@ -381,7 +384,7 @@ func encodeImage(buf *bytes.Buffer) (string, error) {
 func resizeImage(src image.Image, height int) image.Image {
 	dy := src.Bounds().Dy()
 
-	// resize if the current image is higher than the target height
+	// resize if the current image is higher than the src height
 	if height < dy {
 		return imaging.Resize(src, 0, height, imaging.Lanczos)
 	}
@@ -422,7 +425,7 @@ func collectPreviewSrcs(r *os.File) (map[string]string, error) {
 	return m, nil
 }
 
-func marshalPage(fname string, entries []Media) error {
+func marshalPage(p string, entries []Media) error {
 	const tpl = `
 <!DOCTYPE html>
 <html>
@@ -432,7 +435,7 @@ func marshalPage(fname string, entries []Media) error {
 	</head>
 	<body>
 		{{range .Items}}
-		<a href="./{{.Path}}" target="_blank">
+		<a href="./{{.Path}}" src="_blank">
 			<img src="{{.Src}}"/>
 		</a>
 		{{else}}
@@ -452,7 +455,7 @@ func marshalPage(fname string, entries []Media) error {
 		Items: entries,
 	}
 
-	f, err := os.OpenFile(fmt.Sprintf("%s.html", fname), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 
 	if err != nil {
 		return err

@@ -7,8 +7,11 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"os"
 	"path"
+	"runtime"
+	"sync"
 	"text/template"
 
 	"github.com/disintegration/imaging"
@@ -33,20 +36,46 @@ type Media struct {
 	Src string
 }
 
+// default amount of concurrent process worker
+var numWorkers = runtime.NumCPU()
+
 func main() {
 	cwd, err := os.Getwd()
 	if err != nil {
 		panic(err)
 	}
 
-	entries, err := os.ReadDir(cwd)
+	entries := getMedia(cwd)
+
+	computes := make(chan *Media, numWorkers*2)
+	var wg sync.WaitGroup
+
+	// spawn workers
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker(computes, &wg)
+	}
+
+	// send job to workers
+	for i := range entries {
+		computes <- &entries[i]
+	}
+
+	close(computes)
+	wg.Wait()
+	if err := marshalPage(entries); err != nil {
+		panic(err)
+	}
+}
+
+func getMedia(src string) []Media {
+	dirEntries, err := os.ReadDir(src)
 	if err != nil {
 		panic(err)
 	}
 
 	mediaEntries := []Media{}
-
-	for _, e := range entries {
+	for _, e := range dirEntries {
 		if e.IsDir() {
 			continue
 		}
@@ -69,16 +98,20 @@ func main() {
 		}
 	}
 
-	// compute media previews
-	for i := range mediaEntries {
-		computePreview(&mediaEntries[i])
-	}
+	return mediaEntries
+}
 
-	if err := marshalPage(mediaEntries); err != nil {
-		panic(err)
+func worker(computes <-chan *Media, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for media := range computes {
+		if err := computePreview(media); err != nil {
+			fmt.Printf("error generating preview image: %v", err)
+			continue
+		}
 	}
 }
 
+// default height of the resized preview image is set to 150px
 const defaultPreviewHeight = 150
 
 func computePreview(media *Media) error {
@@ -96,20 +129,38 @@ func computePreview(media *Media) error {
 			if err := jpeg.Encode(buf, img, nil); err != nil {
 				return err
 			}
-			media.Src = fmt.Sprintf("data:image/jpeg;base64,%s", bufToBase64(buf))
+
+			encoded, err := encodeImage(buf)
+			if err != nil {
+				return err
+			}
+			media.Src = fmt.Sprintf("data:image/jpeg;base64,%s", encoded)
 		} else {
 			if err := png.Encode(buf, img); err != nil {
 				return err
 			}
-			media.Src = fmt.Sprintf("data:image/png;base64,%s", bufToBase64(buf))
+			encoded, err := encodeImage(buf)
+			if err != nil {
+				return err
+			}
+			media.Src = fmt.Sprintf("data:image/png;base64,%s", encoded)
 		}
 	}
 
 	return nil
 }
 
-func bufToBase64(buf *bytes.Buffer) string {
-	return base64.StdEncoding.EncodeToString(buf.Bytes())
+// encodes image's buffer into base64 string
+func encodeImage(buf *bytes.Buffer) (string, error) {
+	var out bytes.Buffer
+	enc := base64.NewEncoder(base64.StdEncoding, &out)
+	_, err := io.Copy(enc, buf)
+	if err != nil {
+		return "", err
+	}
+	enc.Close()
+
+	return out.String(), nil
 }
 
 func resizeImage(src image.Image, height int) image.Image {

@@ -1,4 +1,4 @@
-module github.com/got-many-wheels/gallerygen
+module github.com/acrobatstick/ggen
 
 go 1.24.3
 

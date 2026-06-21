@@ -1,3 +1,3 @@
 # ggen
 
-Generates static HTML containing previews image in a directory.
+Generate a static HTML image gallery or moodboard from images in a directory.

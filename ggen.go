@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"image"
@@ -10,12 +11,14 @@ import (
 	"io"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"text/template"
 
 	"github.com/disintegration/imaging"
+	"github.com/urfave/cli/v3"
 	"golang.org/x/net/html"
 	"golang.org/x/net/html/atom"
 )
@@ -53,28 +56,58 @@ type result struct {
 	status resultStatus
 }
 
-// default amount of concurrent process worker
-var numWorkers = runtime.NumCPU()
-
 func main() {
-	cwd, err := os.Getwd()
-	if err != nil {
+	cmd := cli.Command{
+		Name:      "ggen",
+		Usage:     "generate image mood board from a directory as html static file",
+		UsageText: "ggen [global options] <directory path>",
+		Flags: []cli.Flag{
+			&cli.IntFlag{
+				Name:    "procs",
+				Aliases: []string{"p"},
+				Usage:   "number of process for the concurrent worker",
+				Value:   runtime.NumCPU(),
+			},
+		},
+		Arguments: []cli.Argument{
+			&cli.StringArg{
+				Name:      "path",
+				UsageText: "<folder path> (default: current working directory)",
+			},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			return run(c)
+		},
+	}
+	if err := cmd.Run(context.Background(), os.Args); err != nil {
 		panic(err)
 	}
+}
 
-	entries := getMedia(cwd)
-	if len(entries) == 0 {
-		fmt.Println("no media sources found in this directory")
-		os.Exit(2)
+func run(c *cli.Command) error {
+	var err error
+	var p string
+
+	p = c.StringArg("path")
+	p, err = resolvePath(p)
+	if err != nil {
+		return fmt.Errorf("error while resolving path: %v", err)
 	}
 
-	computes := make(chan *Media, numWorkers*2)
-	results := make(chan result, numWorkers*2)
+	entries := getMedia(p)
+	if len(entries) == 0 {
+		return fmt.Errorf("no media sources found in this directory\n")
+	}
+
+	procs := c.Int("procs")
+
+	computes := make(chan *Media, procs*2)
+	results := make(chan result, procs*2)
 
 	var wg sync.WaitGroup
 
 	// spawn workers
-	for i := 0; i < numWorkers; i++ {
+	for i := 0; i < procs; i++ {
 		wg.Add(1)
 		go worker(computes, results, &wg)
 	}
@@ -104,10 +137,50 @@ func main() {
 	}
 
 	if err := marshalPage(entries); err != nil {
-		panic(err)
+		return fmt.Errorf("error while marshaling html page: %v", err)
 	}
 
-	os.Exit(1)
+	return nil
+}
+
+func resolvePath(target string) (string, error) {
+	p := target
+	if target == "." || target == "" {
+		dir, err := os.Getwd()
+		if err != nil {
+			return "", err
+		}
+		p = dir
+	} else {
+		if p == "~" {
+			return os.UserHomeDir()
+		}
+
+		if strings.HasPrefix(p, "~") {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return "", err
+			}
+			p = path.Join(home, p[2:])
+		}
+
+		var err error
+		p, err = filepath.Abs(p)
+		if err != nil {
+			return "", err
+		}
+
+		fi, err := os.Stat(p)
+		if err != nil {
+			return "", err
+		}
+
+		if !fi.IsDir() {
+			return "", fmt.Errorf("%q is not a directory", p)
+		}
+	}
+
+	return p, nil
 }
 
 func getMedia(src string) []Media {

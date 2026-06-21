@@ -11,10 +11,13 @@ import (
 	"os"
 	"path"
 	"runtime"
+	"strings"
 	"sync"
 	"text/template"
 
 	"github.com/disintegration/imaging"
+	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 )
 
 type mediaformat string
@@ -46,6 +49,10 @@ func main() {
 	}
 
 	entries := getMedia(cwd)
+	if len(entries) == 0 {
+		fmt.Println("no media sources found in this directory")
+		os.Exit(2)
+	}
 
 	computes := make(chan *Media, numWorkers*2)
 	var wg sync.WaitGroup
@@ -66,6 +73,8 @@ func main() {
 	if err := marshalPage(entries); err != nil {
 		panic(err)
 	}
+
+	os.Exit(1)
 }
 
 func getMedia(src string) []Media {
@@ -87,6 +96,8 @@ func getMedia(src string) []Media {
 			mediaEntries = append(mediaEntries, Media{format: jpgformat, Path: name})
 		case ".png":
 			mediaEntries = append(mediaEntries, Media{format: pngformat, Path: name})
+
+		// UNIMPLEMENTED
 		case ".gif":
 			mediaEntries = append(mediaEntries, Media{format: gifformat, Path: name})
 		case ".webp":
@@ -96,6 +107,35 @@ func getMedia(src string) []Media {
 		case ".mp4":
 			mediaEntries = append(mediaEntries, Media{format: mp4format, Path: name})
 		}
+	}
+
+	// check for existing cache
+	htmlpagePath := "gallery.html"
+	_, err = os.Stat(htmlpagePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return mediaEntries
+		}
+	}
+
+	page, err := os.Open(htmlpagePath)
+	if err != nil {
+		panic(fmt.Sprintf("error opening html page file: %v", err))
+	}
+	defer page.Close()
+
+	srcMap, err := collectPreviewSrcs(page)
+	if err != nil {
+		panic(fmt.Sprintf("error while collecting href on html file: %v", err))
+	}
+
+	for i := range mediaEntries {
+		cur := mediaEntries[i]
+		src, ok := srcMap[cur.Path]
+		if !ok {
+			continue
+		}
+		mediaEntries[i].Src = src
 	}
 
 	return mediaEntries
@@ -115,6 +155,12 @@ func worker(computes <-chan *Media, wg *sync.WaitGroup) {
 const defaultPreviewHeight = 150
 
 func computePreview(media *Media) error {
+	// skip if cached already
+	// TODO: should not skip if height provided is different from the already generated page
+	if len(media.Src) != 0 {
+		return nil
+	}
+
 	switch media.format {
 	case jpgformat, pngformat:
 		img, err := imaging.Open(media.Path)
@@ -172,6 +218,39 @@ func resizeImage(src image.Image, height int) image.Image {
 	}
 
 	return src
+}
+
+func collectPreviewSrcs(r *os.File) (map[string]string, error) {
+	node, err := html.Parse(r)
+	if err != nil {
+		return nil, err
+	}
+
+	m := make(map[string]string)
+
+	for n := range node.Descendants() {
+		if n.Type == html.ElementNode && n.DataAtom == atom.A {
+			var path string
+			for _, a := range n.Attr {
+				if a.Key == "href" {
+					path = strings.TrimLeft(a.Val, "./")
+					break
+				}
+			}
+
+			for c := range n.Descendants() {
+				if c.Type == html.ElementNode && c.DataAtom == atom.Img {
+					for _, a := range c.Attr {
+						if a.Key == "src" {
+							m[path] = a.Val
+						}
+					}
+				}
+			}
+		}
+	}
+
+	return m, nil
 }
 
 func marshalPage(entries []Media) error {

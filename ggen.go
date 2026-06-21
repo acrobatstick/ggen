@@ -10,6 +10,7 @@ import (
 	"image/png"
 	"io"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -67,6 +68,12 @@ func main() {
 				Aliases: []string{"p"},
 				Usage:   "number of process for the concurrent worker",
 				Value:   runtime.NumCPU(),
+			},
+			&cli.BoolFlag{
+				Name:    "open",
+				Aliases: []string{"o"},
+				Usage:   "open the generated html file in your default browser",
+				Value:   false,
 			},
 		},
 		Arguments: []cli.Argument{
@@ -136,11 +143,62 @@ func run(c *cli.Command) error {
 		}
 	}
 
-	if err := marshalPage(entries); err != nil {
+	base := path.Base(p)
+	if err := marshalPage(base, entries); err != nil {
 		return fmt.Errorf("error while marshaling html page: %v", err)
 	}
 
+	open := c.Bool("open")
+	if open {
+		url := fmt.Sprintf("file://%s/%s.html", p, base)
+		return openURL(url)
+	}
+
 	return nil
+}
+
+// openURL opens the specified URL in the default browser of the user.
+func openURL(url string) error {
+	var cmd string
+	var args []string
+
+	switch runtime.GOOS {
+	case "windows":
+		cmd = "cmd.exe"
+		args = []string{"/c", "rundll32", "url.dll,FileProtocolHandler", strings.ReplaceAll(url, "&", "^&")}
+	case "darwin":
+		cmd = "open"
+		args = []string{url}
+	default:
+		if isWSL() {
+			cmd = "cmd.exe"
+			args = []string{"start", url}
+		} else {
+			cmd = "xdg-open"
+			args = []string{url}
+		}
+	}
+
+	e := exec.Command(cmd, args...)
+	err := e.Start()
+	if err != nil {
+		return err
+	}
+	err = e.Wait()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// isWSL checks if the Go program is running inside Windows Subsystem for Linux
+func isWSL() bool {
+	releaseData, err := exec.Command("uname", "-r").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(releaseData)), "microsoft")
 }
 
 func resolvePath(target string) (string, error) {
@@ -216,7 +274,7 @@ func getMedia(src string) []Media {
 	}
 
 	// check for existing cache
-	htmlpagePath := "gallery.html"
+	htmlpagePath := fmt.Sprintf("%s.html", path.Base(src))
 	_, err = os.Stat(htmlpagePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -364,7 +422,7 @@ func collectPreviewSrcs(r *os.File) (map[string]string, error) {
 	return m, nil
 }
 
-func marshalPage(entries []Media) error {
+func marshalPage(fname string, entries []Media) error {
 	const tpl = `
 <!DOCTYPE html>
 <html>
@@ -394,7 +452,7 @@ func marshalPage(entries []Media) error {
 		Items: entries,
 	}
 
-	f, err := os.OpenFile(fmt.Sprintf("%s.html", "gallery"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	f, err := os.OpenFile(fmt.Sprintf("%s.html", fname), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 
 	if err != nil {
 		return err

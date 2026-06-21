@@ -39,6 +39,20 @@ type Media struct {
 	Src string
 }
 
+type resultStatus int
+
+const (
+	resultSuccess resultStatus = iota
+	resultFailed
+	resultCached
+)
+
+type result struct {
+	// the media file path
+	path   string
+	status resultStatus
+}
+
 // default amount of concurrent process worker
 var numWorkers = runtime.NumCPU()
 
@@ -55,12 +69,14 @@ func main() {
 	}
 
 	computes := make(chan *Media, numWorkers*2)
+	results := make(chan result, numWorkers*2)
+
 	var wg sync.WaitGroup
 
 	// spawn workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(computes, &wg)
+		go worker(computes, results, &wg)
 	}
 
 	// send job to workers
@@ -69,7 +85,24 @@ func main() {
 	}
 
 	close(computes)
-	wg.Wait()
+	go func() {
+		defer close(results)
+		wg.Wait()
+	}()
+
+	for res := range results {
+		switch res.status {
+		case resultSuccess:
+			fmt.Printf("Media processed successfully: %s\n", res.path)
+
+		case resultFailed:
+			fmt.Printf("Failed to process media: %s\n", res.path)
+
+		case resultCached:
+			fmt.Printf("Media already cached, skipping processing: %s\n", res.path)
+		}
+	}
+
 	if err := marshalPage(entries); err != nil {
 		panic(err)
 	}
@@ -141,31 +174,36 @@ func getMedia(src string) []Media {
 	return mediaEntries
 }
 
-func worker(computes <-chan *Media, wg *sync.WaitGroup) {
+func worker(computes <-chan *Media, results chan<- result, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for media := range computes {
-		if err := computePreview(media); err != nil {
+		resCode, err := computePreview(media)
+
+		if err != nil {
 			fmt.Printf("error generating preview image: %v", err)
+			results <- result{path: media.Path, status: resCode}
 			continue
 		}
+
+		results <- result{path: media.Path, status: resCode}
 	}
 }
 
 // default height of the resized preview image is set to 150px
 const defaultPreviewHeight = 150
 
-func computePreview(media *Media) error {
+func computePreview(media *Media) (resultStatus, error) {
 	// skip if cached already
 	// TODO: should not skip if height provided is different from the already generated page
 	if len(media.Src) != 0 {
-		return nil
+		return resultCached, nil
 	}
 
 	switch media.format {
 	case jpgformat, pngformat:
 		img, err := imaging.Open(media.Path)
 		if err != nil {
-			return err
+			return resultFailed, err
 		}
 
 		img = resizeImage(img, defaultPreviewHeight) // TODO: make prev height configurable
@@ -173,27 +211,27 @@ func computePreview(media *Media) error {
 
 		if media.format == jpgformat {
 			if err := jpeg.Encode(buf, img, nil); err != nil {
-				return err
+				return resultFailed, err
 			}
 
 			encoded, err := encodeImage(buf)
 			if err != nil {
-				return err
+				return resultFailed, err
 			}
 			media.Src = fmt.Sprintf("data:image/jpeg;base64,%s", encoded)
 		} else {
 			if err := png.Encode(buf, img); err != nil {
-				return err
+				return resultFailed, err
 			}
 			encoded, err := encodeImage(buf)
 			if err != nil {
-				return err
+				return resultFailed, err
 			}
 			media.Src = fmt.Sprintf("data:image/png;base64,%s", encoded)
 		}
 	}
 
-	return nil
+	return resultSuccess, nil
 }
 
 // encodes image's buffer into base64 string

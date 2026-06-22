@@ -119,11 +119,13 @@ func run(c *cli.Command) error {
 		return err
 	}
 
+	var height int
 	if c.IsSet("height") {
-		page.updatePageHeight(c.Int("height"))
+		height = c.Int("height")
 	} else {
-		page.height = page.getHeightFromMeta()
+		height = page.getHeightFromMeta()
 	}
+	page.updatePageHeight(height)
 
 	if len(page.entries) == 0 {
 		return fmt.Errorf("no media sources found in this directory\n")
@@ -521,6 +523,7 @@ func (p *page) updatePageHeight(height int) {
 }
 
 func (p *page) marshal(src string) error {
+	defer clear(p.meta)
 	const tpl = `
 <!DOCTYPE html>
 <html>

@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -36,7 +37,10 @@ const (
 )
 
 type Media struct {
-	format mediaformat
+	// height of the preview images in pixel
+	height         int
+	format         mediaformat
+	needsRecompute bool
 	// relative path to media source
 	Path string
 	// base64 encoded preview of the media file
@@ -57,6 +61,9 @@ type result struct {
 	status resultStatus
 }
 
+// default height of the resized preview image is set to 150px
+const defaultPreviewHeight = 150
+
 func main() {
 	cmd := cli.Command{
 		Name:      "ggen",
@@ -74,6 +81,11 @@ func main() {
 				Aliases: []string{"o"},
 				Usage:   "open the generated html file in your default browser",
 				Value:   false,
+			},
+			&cli.IntFlag{
+				Name:  "height",
+				Usage: "height of the preview images in pixel",
+				Value: defaultPreviewHeight,
 			},
 		},
 		Arguments: []cli.Argument{
@@ -101,8 +113,19 @@ func run(c *cli.Command) error {
 		return fmt.Errorf("error while resolving path: %v", err)
 	}
 
-	entries := getMedia(p)
-	if len(entries) == 0 {
+	page := newPage()
+	err = page.getMediaEntries(p)
+	if err != nil {
+		return err
+	}
+
+	if c.IsSet("height") {
+		page.updatePageHeight(c.Int("height"))
+	} else {
+		page.height = page.getHeightFromMeta()
+	}
+
+	if len(page.entries) == 0 {
 		return fmt.Errorf("no media sources found in this directory\n")
 	}
 
@@ -120,8 +143,8 @@ func run(c *cli.Command) error {
 	}
 
 	// send job to workers
-	for i := range entries {
-		computes <- &entries[i]
+	for i := range page.entries {
+		computes <- &page.entries[i]
 	}
 
 	close(computes)
@@ -145,7 +168,7 @@ func run(c *cli.Command) error {
 
 	base := path.Base(p)
 	absPath := fmt.Sprintf("%s/%s.html", p, base)
-	if err := marshalPage(absPath, entries); err != nil {
+	if err := page.marshal(absPath); err != nil {
 		return fmt.Errorf("error while marshaling html page: %v", err)
 	}
 
@@ -243,71 +266,6 @@ func srcIntoAbs(src string) (string, error) {
 	return p, nil
 }
 
-func getMedia(src string) []Media {
-	dirEntries, err := os.ReadDir(src)
-	if err != nil {
-		panic(err)
-	}
-
-	mediaEntries := []Media{}
-	for _, e := range dirEntries {
-		if e.IsDir() {
-			continue
-		}
-
-		name := e.Name()
-		ext := path.Ext(name)
-		switch ext {
-		case ".jpg":
-			mediaEntries = append(mediaEntries, Media{format: jpgformat, Path: name})
-		case ".png":
-			mediaEntries = append(mediaEntries, Media{format: pngformat, Path: name})
-
-		// UNIMPLEMENTED
-		case ".gif":
-			mediaEntries = append(mediaEntries, Media{format: gifformat, Path: name})
-		case ".webp":
-			mediaEntries = append(mediaEntries, Media{format: webpformat, Path: name})
-		case ".webm":
-			mediaEntries = append(mediaEntries, Media{format: webmformat, Path: name})
-		case ".mp4":
-			mediaEntries = append(mediaEntries, Media{format: mp4format, Path: name})
-		}
-	}
-
-	// check for existing cache
-	base := path.Base(src)
-	absPath := fmt.Sprintf("%s/%s.html", src, base)
-	_, err = os.Stat(absPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return mediaEntries
-		}
-	}
-
-	page, err := os.Open(absPath)
-	if err != nil {
-		panic(fmt.Sprintf("error opening html page file: %v", err))
-	}
-	defer page.Close()
-
-	srcMap, err := collectPreviewSrcs(page)
-	if err != nil {
-		panic(fmt.Sprintf("error while collecting href on html file: %v", err))
-	}
-
-	for i := range mediaEntries {
-		cur := mediaEntries[i]
-		src, ok := srcMap[cur.Path]
-		if !ok {
-			continue
-		}
-		mediaEntries[i].Src = src
-	}
-
-	return mediaEntries
-}
-
 func worker(computes <-chan *Media, results chan<- result, src string, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for media := range computes {
@@ -323,13 +281,8 @@ func worker(computes <-chan *Media, results chan<- result, src string, wg *sync.
 	}
 }
 
-// default height of the resized preview image is set to 150px
-const defaultPreviewHeight = 150
-
 func computePreview(src string, media *Media) (resultStatus, error) {
-	// skip if cached already
-	// TODO: should not skip if height provided is different from the already generated page
-	if len(media.Src) != 0 {
+	if !media.needsRecompute && len(media.Src) != 0 {
 		return resultCached, nil
 	}
 
@@ -340,7 +293,7 @@ func computePreview(src string, media *Media) (resultStatus, error) {
 			return resultFailed, err
 		}
 
-		img = resizeImage(img, defaultPreviewHeight) // TODO: make prev height configurable
+		img = resizeImage(img, media.height)
 		buf := new(bytes.Buffer)
 
 		if media.format == jpgformat {
@@ -392,15 +345,120 @@ func resizeImage(src image.Image, height int) image.Image {
 	return src
 }
 
-func collectPreviewSrcs(r *os.File) (map[string]string, error) {
-	node, err := html.Parse(r)
-	if err != nil {
-		return nil, err
+type page struct {
+	height       int
+	meta         map[string]string
+	entries      []Media
+	mediaSources map[string]string
+}
+
+func newPage() *page {
+	return &page{
+		meta:         make(map[string]string),
+		mediaSources: make(map[string]string),
+		entries:      make([]Media, 0),
+	}
+}
+
+// get existing preview height from the meta tag or use default
+func (p *page) getHeightFromMeta() int {
+	value, ok := p.meta["height"]
+	if !ok {
+		return defaultPreviewHeight
 	}
 
-	m := make(map[string]string)
+	height, err := strconv.Atoi(value)
+	if err != nil {
+		panic(fmt.Sprintf("error converting height value into integer, got=%s %v\n", value, err))
+	}
+	return height
+}
+
+func (p *page) getMediaEntries(src string) error {
+	dirEntries, err := os.ReadDir(src)
+	if err != nil {
+		panic(err)
+	}
+
+	for _, e := range dirEntries {
+		if e.IsDir() {
+			continue
+		}
+
+		name := e.Name()
+		ext := path.Ext(name)
+		m := Media{Path: name, height: defaultPreviewHeight}
+
+		switch ext {
+		case ".jpg":
+			m.format = jpgformat
+		case ".png":
+			m.format = pngformat
+
+		// UNIMPLEMENTED
+		case ".gif":
+			m.format = gifformat
+		case ".webp":
+			m.format = webpformat
+		case ".webm":
+			m.format = webmformat
+		case ".mp4":
+			m.format = mp4format
+
+		default:
+			// ignore non media files
+			continue
+		}
+
+		p.entries = append(p.entries, m)
+	}
+
+	return p.attemptCache(src)
+}
+
+func (p *page) unmarshal(src string) error {
+	// check for existing cache
+	base := path.Base(src)
+	absPath := fmt.Sprintf("%s/%s.html", src, base)
+	_, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	r, err := os.Open(absPath)
+	if err != nil {
+		return fmt.Errorf("error opening html page file: %v", err)
+	}
+	defer r.Close()
+
+	node, err := html.Parse(r)
+	if err != nil {
+		return err
+	}
 
 	for n := range node.Descendants() {
+		// parse meta tags
+		if n.Type == html.ElementNode && n.DataAtom == atom.Meta {
+			var key, val string
+
+			for _, a := range n.Attr {
+				switch a.Key {
+				case "name":
+					key = a.Val
+				case "content":
+					val = a.Val
+				}
+			}
+
+			if key != "" && val != "" {
+				p.meta[key] = val
+			}
+		}
+
+		// parse anchor tags
 		if n.Type == html.ElementNode && n.DataAtom == atom.A {
 			var path string
 			for _, a := range n.Attr {
@@ -414,7 +472,7 @@ func collectPreviewSrcs(r *os.File) (map[string]string, error) {
 				if c.Type == html.ElementNode && c.DataAtom == atom.Img {
 					for _, a := range c.Attr {
 						if a.Key == "src" {
-							m[path] = a.Val
+							p.mediaSources[path] = a.Val
 						}
 					}
 				}
@@ -422,16 +480,54 @@ func collectPreviewSrcs(r *os.File) (map[string]string, error) {
 		}
 	}
 
-	return m, nil
+	return nil
 }
 
-func marshalPage(p string, entries []Media) error {
+func (p *page) attemptCache(src string) error {
+	err := p.unmarshal(src)
+	if err != nil {
+		return fmt.Errorf("error while unmarshaling html file: %v", err)
+	}
+
+	// build media source from the cache
+	for i := range p.entries {
+		cur := p.entries[i]
+		src, ok := p.mediaSources[cur.Path]
+		if !ok {
+			continue
+		}
+		p.entries[i].Src = src
+	}
+	clear(p.mediaSources)
+
+	return nil
+}
+
+func (p *page) updatePageHeight(height int) {
+	p.height = height
+	// update all the entries height with the new page height
+	for i := range p.entries {
+		p.entries[i].height = p.height
+	}
+	// should recompute if height provided is different
+	prevHeight := p.getHeightFromMeta()
+	if prevHeight != height {
+		for i := range p.entries {
+			p.entries[i].needsRecompute = true
+		}
+	}
+
+	fmt.Println("using p.height", p.height)
+}
+
+func (p *page) marshal(src string) error {
 	const tpl = `
 <!DOCTYPE html>
 <html>
 	<head>
 		<meta charset="UTF-8">
 		<title>My Galery</title>
+		<meta name="height" content="{{.Height}}" />
 	</head>
 	<body>
 		{{range .Items}}
@@ -450,12 +546,14 @@ func marshalPage(p string, entries []Media) error {
 	}
 
 	data := struct {
-		Items []Media
+		Items  []Media
+		Height int
 	}{
-		Items: entries,
+		Items:  p.entries,
+		Height: p.height,
 	}
 
-	f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	f, err := os.OpenFile(src, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 
 	if err != nil {
 		return err

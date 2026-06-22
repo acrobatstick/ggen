@@ -19,6 +19,7 @@ import (
 	"sync"
 	"text/template"
 
+	tea "charm.land/bubbletea/v2"
 	"github.com/disintegration/imaging"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/net/html"
@@ -57,8 +58,9 @@ const (
 
 type result struct {
 	// the media file path
-	path   string
-	status resultStatus
+	path    string
+	status  resultStatus
+	message string
 }
 
 // default height of the resized preview image is set to 150px
@@ -105,16 +107,16 @@ func main() {
 
 func run(c *cli.Command) error {
 	var err error
-	var p string
+	var src string
 
-	p = c.StringArg("path")
-	p, err = srcIntoAbs(p)
+	src = c.StringArg("path")
+	src, err = srcIntoAbs(src)
 	if err != nil {
 		return fmt.Errorf("error while resolving path: %v", err)
 	}
 
 	page := newPage()
-	err = page.getMediaEntries(p)
+	err = page.getMediaEntries(src)
 	if err != nil {
 		return err
 	}
@@ -131,17 +133,28 @@ func run(c *cli.Command) error {
 		return fmt.Errorf("no media sources found in this directory\n")
 	}
 
+	openBrowser := c.Bool("open")
 	procs := c.Int("procs")
 
+	m := newModel(len(page.entries))
+	prog := tea.NewProgram(m)
+
+	go process(prog, page, src, procs, openBrowser)
+
+	_, err = prog.Run()
+
+	return err
+}
+
+func process(prog *tea.Program, page *page, src string, procs int, openBrowser bool) {
 	computes := make(chan *Media, procs*2)
 	results := make(chan result, procs*2)
-
 	var wg sync.WaitGroup
 
 	// spawn workers
-	for i := 0; i < procs; i++ {
+	for range procs {
 		wg.Add(1)
-		go worker(computes, results, p, &wg)
+		go worker(computes, results, src, &wg)
 	}
 
 	// send job to workers
@@ -156,31 +169,24 @@ func run(c *cli.Command) error {
 	}()
 
 	for res := range results {
-		switch res.status {
-		case resultSuccess:
-			fmt.Printf("Media processed successfully: %s\n", res.path)
-
-		case resultFailed:
-			fmt.Printf("Failed to process media: %s\n", res.path)
-
-		case resultCached:
-			fmt.Printf("Media already cached, skipping processing: %s\n", res.path)
-		}
+		prog.Send(res)
 	}
 
-	base := path.Base(p)
-	absPath := fmt.Sprintf("%s/%s.html", p, base)
+	base := path.Base(src)
+	absPath := fmt.Sprintf("%s/%s.html", src, base)
 	if err := page.marshal(absPath); err != nil {
-		return fmt.Errorf("error while marshaling html page: %v", err)
+		// return fmt.Errorf("error while marshaling html page: %v", err)
+		prog.Send(errorMsg(err))
+		return
 	}
 
-	open := c.Bool("open")
-	if open {
+	if openBrowser {
 		url := fmt.Sprintf("file://%s", absPath)
-		return openURL(url)
+		err := openURL(url)
+		prog.Send(errorMsg(err))
 	}
 
-	return nil
+	prog.Send(doneMsg{})
 }
 
 // openURL opens the specified URL in the default browser of the user.
@@ -274,7 +280,6 @@ func worker(computes <-chan *Media, results chan<- result, src string, wg *sync.
 		resCode, err := computePreview(src, media)
 
 		if err != nil {
-			fmt.Printf("error generating preview image: %v\n", err)
 			results <- result{path: media.Path, status: resCode}
 			continue
 		}
@@ -518,8 +523,6 @@ func (p *page) updatePageHeight(height int) {
 			p.entries[i].needsRecompute = true
 		}
 	}
-
-	fmt.Println("using p.height", p.height)
 }
 
 func (p *page) marshal(src string) error {

@@ -9,6 +9,7 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path"
@@ -84,6 +85,12 @@ func main() {
 				Usage:   "open the generated html file in your default browser",
 				Value:   false,
 			},
+			&cli.BoolFlag{
+				Name:    "recurse",
+				Aliases: []string{"r"},
+				Usage:   "recursively process images into any subdirectories",
+				Value:   false,
+			},
 			&cli.IntFlag{
 				Name:  "height",
 				Usage: "height of the preview images in pixel",
@@ -100,6 +107,7 @@ func main() {
 			return run(c)
 		},
 	}
+
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
 		panic(err)
 	}
@@ -107,39 +115,46 @@ func main() {
 
 func run(c *cli.Command) error {
 	var err error
-	var src string
-
-	src = c.StringArg("path")
+	src := c.StringArg("path")
 	src, err = srcIntoAbs(src)
 	if err != nil {
 		return fmt.Errorf("error while resolving path: %v", err)
 	}
 
-	page := newPage()
-	err = page.getMediaEntries(src)
+	recurse := c.Bool("recurse")
+	pages, err := findPages(src, recurse)
 	if err != nil {
 		return err
 	}
 
-	var height int
-	if c.IsSet("height") {
-		height = c.Int("height")
-	} else {
-		height = page.getHeightFromMeta()
-	}
-	page.updatePageHeight(height)
+	var entries []Media
 
-	if len(page.entries) == 0 {
-		return fmt.Errorf("no media sources found in this directory\n")
+	// update the height, and populate the entries array with media sources
+	// coming from each page
+	for _, p := range pages {
+		var height int
+		if c.IsSet("height") {
+			height = c.Int("height")
+		} else {
+			height = p.getHeightFromMeta()
+		}
+		p.updatePageHeight(height)
+		entries = append(entries, p.entries...)
+	}
+
+	if len(entries) == 0 {
+		return fmt.Errorf("no media sources provided\n")
 	}
 
 	openBrowser := c.Bool("open")
 	procs := c.Int("procs")
 
-	m := newModel(len(page.entries))
+	m := newModel(len(entries), len(pages))
 	prog := tea.NewProgram(m)
 
-	go process(prog, page, src, procs, openBrowser)
+	for _, page := range pages {
+		go process(prog, page, src, procs, openBrowser)
+	}
 
 	_, err = prog.Run()
 
@@ -172,11 +187,11 @@ func process(prog *tea.Program, page *page, src string, procs int, openBrowser b
 		prog.Send(res)
 	}
 
+	src = path.Join(src, page.relativePath)
 	base := path.Base(src)
 	absPath := fmt.Sprintf("%s/%s.html", src, base)
 	if err := page.marshal(absPath); err != nil {
-		// return fmt.Errorf("error while marshaling html page: %v", err)
-		prog.Send(errorMsg(err))
+		prog.Send(errorMsg(fmt.Errorf("error while marshaling html page: %v", err)))
 		return
 	}
 
@@ -280,7 +295,7 @@ func worker(computes <-chan *Media, results chan<- result, src string, wg *sync.
 		resCode, err := computePreview(src, media)
 
 		if err != nil {
-			results <- result{path: media.Path, status: resCode}
+			results <- result{path: media.Path, status: resCode, message: err.Error()}
 			continue
 		}
 
@@ -353,6 +368,7 @@ func resizeImage(src image.Image, height int) image.Image {
 }
 
 type page struct {
+	relativePath string
 	height       int
 	meta         map[string]string
 	entries      []Media
@@ -381,50 +397,99 @@ func (p *page) getHeightFromMeta() int {
 	return height
 }
 
-func (p *page) getMediaEntries(src string) error {
-	dirEntries, err := os.ReadDir(src)
-	if err != nil {
-		panic(err)
-	}
-
-	for _, e := range dirEntries {
-		if e.IsDir() {
-			continue
+func findPages(src string, recurse bool) ([]*page, error) {
+	dirs := make(map[string]*page)
+	err := filepath.WalkDir(src, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
 
-		name := e.Name()
-		ext := path.Ext(name)
-		m := Media{Path: name, height: defaultPreviewHeight}
+		dir := filepath.Dir(p)
+		relDir, err := filepath.Rel(src, dir)
+		if err != nil {
+			return err
+		}
+
+		if relDir == "." {
+			relDir = ""
+		}
+		if strings.HasPrefix(relDir, "..") {
+			return nil
+		}
+
+		// should not continue if we're not recursively walk every sub-directories
+		if !recurse && len(relDir) > 0 {
+			return fs.SkipDir
+		}
+
+		// init page if not exists
+		pg, ok := dirs[relDir]
+		if !ok {
+			pg = newPage()
+			pg.relativePath = relDir
+			dirs[relDir] = pg
+		}
+
+		if d.IsDir() {
+			return nil
+		}
+
+		name := filepath.Base(p)
+		ext := strings.ToLower(path.Ext(name))
+
+		m := Media{
+			Path:   mustRel(src, p),
+			height: defaultPreviewHeight,
+		}
 
 		switch ext {
 		case ".jpg":
 			m.format = jpgformat
 		case ".png":
 			m.format = pngformat
-
-		// UNIMPLEMENTED
 		case ".gif":
 			m.format = gifformat
+
+		// UNIMPLEMENTED
 		case ".webp":
 			m.format = webpformat
 		case ".webm":
 			m.format = webmformat
 		case ".mp4":
 			m.format = mp4format
-
 		default:
-			// ignore non media files
-			continue
+			return nil
 		}
 
-		p.entries = append(p.entries, m)
+		pg.entries = append(pg.entries, m)
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("error while walking through directories: %v", err)
 	}
 
-	return p.attemptCache(src)
+	var pages []*page
+	for _, pg := range dirs {
+		if err := pg.attemptCache(src); err != nil {
+			return nil, err
+		}
+		pages = append(pages, pg)
+	}
+
+	return pages, nil
+}
+
+// small helper to avoid repeated error handling noise
+func mustRel(base, target string) string {
+	rel, err := filepath.Rel(base, target)
+	if err != nil {
+		return target
+	}
+	return rel
 }
 
 func (p *page) unmarshal(src string) error {
-	// check for existing cache
 	base := path.Base(src)
 	absPath := fmt.Sprintf("%s/%s.html", src, base)
 	_, err := os.Stat(absPath)
@@ -491,7 +556,7 @@ func (p *page) unmarshal(src string) error {
 }
 
 func (p *page) attemptCache(src string) error {
-	err := p.unmarshal(src)
+	err := p.unmarshal(path.Join(src, p.relativePath))
 	if err != nil {
 		return fmt.Errorf("error while unmarshaling html file: %v", err)
 	}
@@ -505,6 +570,7 @@ func (p *page) attemptCache(src string) error {
 		}
 		p.entries[i].Src = src
 	}
+
 	clear(p.mediaSources)
 
 	return nil
@@ -525,7 +591,7 @@ func (p *page) updatePageHeight(height int) {
 	}
 }
 
-func (p *page) marshal(src string) error {
+func (p *page) marshal(htmlPath string) error {
 	defer clear(p.meta)
 	const tpl = `
 <!DOCTYPE html>
@@ -559,7 +625,7 @@ func (p *page) marshal(src string) error {
 		Height: p.height,
 	}
 
-	f, err := os.OpenFile(src, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+	f, err := os.OpenFile(htmlPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
 
 	if err != nil {
 		return err

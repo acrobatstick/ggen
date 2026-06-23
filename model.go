@@ -16,23 +16,26 @@ var (
 	checkMark = lipgloss.NewStyle().Foreground(lipgloss.Color("42")).SetString("✓")
 	errorMark = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).SetString("✗")
 	infoMark  = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).SetString("i")
+	errStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 )
 
 type model struct {
-	spinner   spinner.Model
-	progress  progress.Model
-	completed int
-	mediaLen  int
-	done      bool
-	width     int
-	height    int
+	spinner       spinner.Model
+	progress      progress.Model
+	completed     int
+	mediaLen      int
+	pageLen       int
+	pageCompleted int
+	done          bool
+	width         int
+	height        int
 }
 
 type errorMsg error
 
 type doneMsg struct{}
 
-func newModel(mediaLen int) model {
+func newModel(mediaLen int, pageLen int) model {
 	p := progress.New(
 		progress.WithDefaultBlend(),
 		progress.WithWidth(40),
@@ -44,6 +47,7 @@ func newModel(mediaLen int) model {
 		spinner:  s,
 		progress: p,
 		mediaLen: mediaLen,
+		pageLen:  pageLen,
 	}
 }
 
@@ -80,14 +84,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case resultCached:
 			print = tea.Printf("%s  Already cached, skipping: %s", infoMark, src)
 		case resultFailed:
-			print = tea.Printf("%s Processing failed: %s", errorMark, src)
+			print = tea.Printf(
+				"%s Processing failed: %s\n%s",
+				errorMark,
+				src,
+				errStyle.Render("    "+msg.message),
+			)
 		}
 
 		return m, tea.Batch(progressCmd, print)
 
 	case doneMsg:
-		m.done = true
-		return m, tea.Quit
+		m.pageCompleted++
+		if m.pageCompleted == m.pageLen {
+			m.done = true
+			return m, tea.Quit
+		}
+		return m, nil
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd

@@ -104,6 +104,8 @@ func main() {
 			},
 		},
 		Action: func(ctx context.Context, c *cli.Command) error {
+			// temporary solution to fix scrollback buffer stacking up run after another
+			fmt.Print("\033[H\033[2J")
 			return run(c)
 		},
 	}
@@ -157,7 +159,6 @@ func run(c *cli.Command) error {
 	}
 
 	_, err = prog.Run()
-
 	return err
 }
 
